@@ -1,0 +1,6 @@
+.git
+.gitlab-ci.yml
+README.md
+node_modules
+*.pyc
+__pycache__

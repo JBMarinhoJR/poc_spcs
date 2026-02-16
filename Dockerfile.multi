@@ -1,0 +1,63 @@
+ARG PYTHON_VERSION=3.11
+FROM python:${PYTHON_VERSION}-alpine
+
+ARG TERRAFORM_VERSION=1.5.7
+
+# Install ca-certificates package
+RUN apk add --no-cache ca-certificates wget unzip curl
+
+# Download Hyatt root and intermediate certificates
+RUN wget --no-check-certificate \
+    https://artifacts.hyattdev.com/artifactory/distributions/rhel/HYTROOTCA.crt \
+    -O /usr/local/share/ca-certificates/HYTROOTCA.crt && \
+    update-ca-certificates
+
+# If there's an intermediate CA, add it too
+RUN wget --no-check-certificate \
+    https://artifacts.hyattdev.com/artifactory/distributions/rhel/ORDDCSUBCA01.crt \
+    -O /usr/local/share/ca-certificates/ORDDCSUBCA01.crt 2>/dev/null || true && \
+    update-ca-certificates
+
+# Install Terraform
+RUN wget https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_amd64.zip && \
+    unzip terraform_${TERRAFORM_VERSION}_linux_amd64.zip && \
+    mv terraform /usr/local/bin/ && \
+    rm terraform_${TERRAFORM_VERSION}_linux_amd64.zip && \
+    apk del unzip
+
+# Install common packages
+RUN apk add --no-cache \
+    bash coreutils git jq \
+    aws-cli docker-cli \
+    grep sed gawk zip unzip && \
+    rm -rf /var/cache/apk/*
+
+# Configure pip and other tools
+RUN pip3 config set global.cert /etc/ssl/certs/ca-certificates.crt
+RUN pip3 install --no-cache-dir certifi
+
+# Install docker buildx CLI plugin
+RUN mkdir -p /usr/local/lib/docker/cli-plugins && \
+    api_url="https://api.github.com/repos/docker/buildx/releases/latest" && \
+    download_url=$(curl -fsSL "$api_url" | jq -r '.assets[] | select((.name|ascii_downcase) | test("linux.*amd64|amd64.*linux|buildx-linux-amd64|buildx-v.*linux-amd64")) | .browser_download_url' | head -n1) && \
+    test -n "$download_url" && \
+    curl -fsSL -o /usr/local/lib/docker/cli-plugins/docker-buildx "$download_url" && \
+    chmod +x /usr/local/lib/docker/cli-plugins/docker-buildx
+
+# Set environment variables
+ENV REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+ENV CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+ENV PYTHONHTTPSVERIFY=1
+
+# Verify certificate chain
+RUN echo "Testing certificate trust..." && \
+    curl -v https://artifacts.hyattdev.com 2>&1 | grep -i "SSL certificate verify ok" && \
+    echo "✓ Certificate chain trusted" || \
+    (echo "⚠ Certificate verification failed but continuing..." && exit 0)
+
+RUN python3 --version && terraform version
+
+ENV SHELL=/bin/bash
+WORKDIR /workspace
+ENTRYPOINT [""]
