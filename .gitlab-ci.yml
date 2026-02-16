@@ -13,7 +13,7 @@ default:
     name: 354156725301.dkr.ecr.us-east-1.amazonaws.com/hdp-iac-custom-image:latest
     entrypoint: [""]
   tags:
-    - sf-dev-n-uat-db-objects-project-runner
+    - hdp-gitlab-runner-Docker-DEV   # sf-dev-n-uat-db-objects-project-runner
 
 stages:
   - build
