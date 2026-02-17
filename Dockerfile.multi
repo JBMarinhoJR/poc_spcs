@@ -2,36 +2,9 @@ ARG PYTHON_VERSION=3.11
 FROM python:${PYTHON_VERSION}-alpine
 
 ARG TERRAFORM_VERSION=1.5.7
-ARG HYATT_CERTS_REQUIRED=true
 
 # Install ca-certificates package
 RUN apk add --no-cache ca-certificates wget unzip curl
-
-# Download Hyatt root certificate.
-# In public runners, DNS for artifacts.hyattdev.com may not resolve.
-RUN set -eux; \
-    if wget --no-check-certificate \
-      https://artifacts.hyattdev.com/artifactory/distributions/rhel/HYTROOTCA.crt \
-      -O /usr/local/share/ca-certificates/HYTROOTCA.crt; then \
-      update-ca-certificates; \
-      echo "Hyatt root certificate installed."; \
-    elif [ "${HYATT_CERTS_REQUIRED}" = "true" ]; then \
-      echo "Failed to download Hyatt root certificate and HYATT_CERTS_REQUIRED=true." >&2; \
-      exit 1; \
-    else \
-      echo "Skipping Hyatt root certificate (HYATT_CERTS_REQUIRED=false)."; \
-    fi
-
-# If there's an intermediate CA, add it too
-RUN set -eux; \
-    if wget --no-check-certificate \
-      https://artifacts.hyattdev.com/artifactory/distributions/rhel/ORDDCSUBCA01.crt \
-      -O /usr/local/share/ca-certificates/ORDDCSUBCA01.crt; then \
-      update-ca-certificates; \
-      echo "Hyatt intermediate certificate installed."; \
-    else \
-      echo "Hyatt intermediate certificate not available. Continuing."; \
-    fi
 
 # Install Terraform
 RUN wget https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_amd64.zip && \
@@ -64,16 +37,6 @@ ENV REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
 ENV CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
 ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 ENV PYTHONHTTPSVERIFY=1
-
-# Verify internal certificate chain only when required.
-RUN set -eux; \
-    if [ "${HYATT_CERTS_REQUIRED}" = "true" ]; then \
-      echo "Testing internal certificate trust..."; \
-      curl -v https://artifacts.hyattdev.com 2>&1 | grep -i "SSL certificate verify ok"; \
-      echo "Internal certificate chain trusted."; \
-    else \
-      echo "Skipping internal certificate validation (HYATT_CERTS_REQUIRED=false)."; \
-    fi
 
 RUN python3 --version && terraform version
 
