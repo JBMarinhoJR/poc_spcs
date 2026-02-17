@@ -95,6 +95,7 @@ jobs:
               --pull \
               --build-arg PYTHON_VERSION="${VERSION}" \
               --build-arg TERRAFORM_VERSION="${TERRAFORM_VERSION}" \
+              --build-arg HYATT_CERTS_REQUIRED=false \
               -t "${FULL_IMAGE}" \
               -f Dockerfile.multi .
 
