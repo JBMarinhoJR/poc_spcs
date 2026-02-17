@@ -1,5 +1,3 @@
-# chunkuo.li
-
 ## GitHub Actions Setup
 
 GitHub Actions pipeline for Snowflake image push is configured at:
