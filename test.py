@@ -1,4 +1,5 @@
 import argparse
+from datetime import datetime
 import os
 import re
 import sys
@@ -47,13 +48,18 @@ def get_value(row, cols, *names):
             return row[cols.index(name)]
     return None
 
+def to_text(value):
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return str(value)
+
 def print_repo_images(repo_fqn_display, rows, cols):
     print(f"Images in repository: {repo_fqn_display}")
 
     pairs = []
     for row in rows:
         img = get_value(row, cols, "image_name", "name")
-        tag = get_value(row, cols, "tag")
+        tag = get_value(row, cols, "tag", "tags")
         if img and tag:
             pairs.append((str(img), str(tag)))
 
@@ -65,6 +71,24 @@ def print_repo_images(repo_fqn_display, rows, cols):
     for img, tag in pairs:
         print(f"  - {img}:{tag}")
 
+def print_columns(cols):
+    print("Available columns:")
+    for col in cols:
+        print(f"  - {col}")
+
+def print_repo_images_detailed(repo_fqn_display, rows, cols):
+    print(f"Images in repository: {repo_fqn_display}")
+    print_columns(cols)
+    print(f"Row count: {len(rows)}")
+
+    if not rows:
+        return
+
+    for i, row in enumerate(rows, start=1):
+        print(f"\n[{i}]")
+        for idx, col in enumerate(cols):
+            print(f"  {col}: {to_text(row[idx])}")
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Check or list images in a Snowflake image repository."
@@ -73,6 +97,16 @@ def parse_args():
         "--list",
         action="store_true",
         help="List all image:tag entries in the configured repository and exit.",
+    )
+    parser.add_argument(
+        "--list-detailed",
+        action="store_true",
+        help="List all rows with all available fields and values.",
+    )
+    parser.add_argument(
+        "--columns",
+        action="store_true",
+        help="Show all available columns returned by SHOW IMAGES.",
     )
     parser.add_argument(
         "--image",
@@ -125,6 +159,14 @@ def main():
             rows = cur.fetchall()
             cols = [c[0].lower() for c in cur.description]
 
+            if args.columns:
+                print_columns(cols)
+                sys.exit(0)
+
+            if args.list_detailed:
+                print_repo_images_detailed(repo_fqn_display, rows, cols)
+                sys.exit(0)
+
             if args.list:
                 print_repo_images(repo_fqn_display, rows, cols)
                 sys.exit(0)
@@ -132,7 +174,7 @@ def main():
             found = False
             for r in rows:
                 img_name = get_value(r, cols, "image_name", "name")
-                img_tag  = get_value(r, cols, "tag")
+                img_tag  = get_value(r, cols, "tag", "tags")
                 if (img_name == image) and (img_tag == tag):
                     found = True
                     break
