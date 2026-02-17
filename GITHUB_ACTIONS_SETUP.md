@@ -6,6 +6,10 @@ This repository now has a workflow at:
 
 It builds Docker images from `Dockerfile.multi` and pushes tags (`py311`, `py312`, `py313`, `py314`) to your Snowflake image repository.
 
+For Streamlit app image build/push, use:
+
+`/.github/workflows/build-push-streamlit-image.yml`
+
 ## 1. Create or make the GitHub repository public
 
 If the repo already exists on GitHub:
@@ -46,6 +50,12 @@ You can also run manually:
 2. Open `Build and Push Snowflake Image`.
 3. Click `Run workflow`.
 
+For Streamlit app image:
+
+1. Go to `Actions`.
+2. Open `Build and Push Streamlit Image`.
+3. Click `Run workflow` (keep tag `streamlit-ui`).
+
 ## 4. Validate images in Snowflake
 
 Use your local script:
@@ -53,6 +63,17 @@ Use your local script:
 ```powershell
 python test.py --list
 ```
+
+You should see `ds-repo-docker-custom-image:streamlit-ui`.
+
+## 5. Deploy SPCS Streamlit service
+
+Run these SQL files in order (Snowsight Worksheet):
+
+1. `spcs/deploy_streamlit_service.sql`
+2. `spcs/monitor_streamlit_service.sql`
+
+Get `ingress_url` from the `SHOW ENDPOINTS` result and open it in your browser.
 
 ## Notes
 
