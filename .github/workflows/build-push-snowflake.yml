@@ -5,6 +5,11 @@ on:
     branches:
       - main
   workflow_dispatch:
+    inputs:
+      py_versions:
+        description: "Python versions to build (space-separated)"
+        required: false
+        default: "3.11"
 
 permissions:
   contents: read
@@ -14,7 +19,9 @@ jobs:
     runs-on: ubuntu-latest
     env:
       TERRAFORM_VERSION: "1.5.7"
-      PY_VERSIONS: "3.11 3.12 3.13 3.14"
+      PY_VERSIONS: ${{ github.event.inputs.py_versions || '3.11 3.12 3.13 3.14' }}
+      PUSH_RETRIES: "8"
+      PUSH_INITIAL_BACKOFF_SECONDS: "20"
       SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
       SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
       SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
@@ -26,6 +33,14 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Tune Docker daemon for unstable uploads
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo '{"max-concurrent-uploads": 1, "max-concurrent-downloads": 3}' | sudo tee /etc/docker/daemon.json
+          sudo systemctl restart docker
+          docker info
 
       - name: Validate required secrets
         shell: bash
@@ -102,6 +117,35 @@ jobs:
             docker run --rm "${FULL_IMAGE}" python --version || true
 
             echo "Pushing ${FULL_IMAGE}"
-            docker push "${FULL_IMAGE}"
+            attempt=1
+            pushed=0
+            backoff="${PUSH_INITIAL_BACKOFF_SECONDS}"
+            while [ "${attempt}" -le "${PUSH_RETRIES}" ]; do
+              echo "Push attempt ${attempt}/${PUSH_RETRIES} for ${FULL_IMAGE}"
+              if docker push "${FULL_IMAGE}"; then
+                pushed=1
+                break
+              fi
+
+              echo "Push failed for ${FULL_IMAGE} (attempt ${attempt})."
+              echo "Refreshing Snowflake registry login before retry..."
+              snow spcs image-registry login -x || true
+
+              echo "Sleeping ${backoff}s before retry..."
+              sleep "${backoff}"
+              if [ "${backoff}" -lt 300 ]; then
+                backoff=$((backoff * 2))
+                if [ "${backoff}" -gt 300 ]; then
+                  backoff=300
+                fi
+              fi
+
+              attempt=$((attempt + 1))
+            done
+
+            if [ "${pushed}" -ne 1 ]; then
+              echo "Failed to push ${FULL_IMAGE} after ${PUSH_RETRIES} attempts."
+              exit 1
+            fi
             echo "Pushed ${FULL_IMAGE}"
           done
