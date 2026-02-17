@@ -23,14 +23,14 @@ Already a pro? Just edit this README.md and make it your own. Want to make it ea
 
 ```
 cd existing_repo
-git remote add origin https://gitlab.hyattdev.com/hyatt/DS/sandbox/chunkuo.li.git
+git remote add origin https://gitlab.example.com/group/project.git
 git branch -M main
 git push -uf origin main
 ```
 
 ## Integrate with your tools
 
-- [ ] [Set up project integrations](https://gitlab.hyattdev.com/hyatt/DS/sandbox/chunkuo.li/-/settings/integrations)
+- [ ] [Set up project integrations](https://docs.gitlab.com/ee/user/project/integrations/)
 
 ## Collaborate with your team
 

@@ -57,4 +57,3 @@ python test.py --list
 ## Notes
 
 - `snowflake_env.ps1` is now ignored by Git via `.gitignore` to avoid accidental credential leaks.
-- If the workflow fails during cert download in `Dockerfile.multi` (Hyatt internal URLs), the GitHub runner may not have access to those internal endpoints.
