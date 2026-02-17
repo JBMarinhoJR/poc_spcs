@@ -1,0 +1,105 @@
+name: Build and Push Snowflake Image
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    env:
+      TERRAFORM_VERSION: "1.5.7"
+      PY_VERSIONS: "3.11 3.12 3.13 3.14"
+      SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+      SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+      SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+      SNOWFLAKE_ROLE: ${{ secrets.SNOWFLAKE_ROLE }}
+      SNOWFLAKE_DB: ${{ secrets.SNOWFLAKE_DB }}
+      SNOWFLAKE_SCHEMA: ${{ secrets.SNOWFLAKE_SCHEMA }}
+      SNOWFLAKE_IMAGE_REPO: ${{ secrets.SNOWFLAKE_IMAGE_REPO }}
+      IMAGE_NAME: ${{ secrets.IMAGE_NAME }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate required secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          required=(
+            SNOWFLAKE_ACCOUNT
+            SNOWFLAKE_USER
+            SNOWFLAKE_PASSWORD
+            SNOWFLAKE_ROLE
+            SNOWFLAKE_DB
+            SNOWFLAKE_SCHEMA
+            SNOWFLAKE_IMAGE_REPO
+            IMAGE_NAME
+          )
+          for name in "${required[@]}"; do
+            if [ -z "${!name:-}" ]; then
+              echo "Missing required secret: ${name}"
+              exit 1
+            fi
+          done
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Snowflake CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install snowflake-cli
+          snow --version
+
+      - name: Test Snowflake connection
+        shell: bash
+        run: |
+          set -euo pipefail
+          snow connection test -x
+
+      - name: Login to Snowflake image registry
+        shell: bash
+        run: |
+          set -euo pipefail
+          snow spcs image-registry login -x
+
+      - name: Build and push images
+        shell: bash
+        run: |
+          set -euo pipefail
+          export DOCKER_BUILDKIT=1
+
+          SNOWFLAKE_REGISTRY_HOST="$(echo "${SNOWFLAKE_ACCOUNT}" | tr '[:upper:]' '[:lower:]').registry.snowflakecomputing.com"
+          SNOWFLAKE_REPO_URL="${SNOWFLAKE_REGISTRY_HOST}/$(echo "${SNOWFLAKE_DB}" | tr '[:upper:]' '[:lower:]')/$(echo "${SNOWFLAKE_SCHEMA}" | tr '[:upper:]' '[:lower:]')/$(echo "${SNOWFLAKE_IMAGE_REPO}" | tr '[:upper:]' '[:lower:]')"
+
+          echo "Using repository URL: ${SNOWFLAKE_REPO_URL}"
+
+          for VERSION in ${PY_VERSIONS}; do
+            TAG="py${VERSION//./}"
+            FULL_IMAGE="${SNOWFLAKE_REPO_URL}/${IMAGE_NAME}:${TAG}"
+
+            echo "Building ${FULL_IMAGE} (Python ${VERSION})"
+            docker build \
+              --pull \
+              --build-arg PYTHON_VERSION="${VERSION}" \
+              --build-arg TERRAFORM_VERSION="${TERRAFORM_VERSION}" \
+              -t "${FULL_IMAGE}" \
+              -f Dockerfile.multi .
+
+            echo "Smoke test for ${FULL_IMAGE}"
+            docker run --rm "${FULL_IMAGE}" python --version || true
+
+            echo "Pushing ${FULL_IMAGE}"
+            docker push "${FULL_IMAGE}"
+            echo "Pushed ${FULL_IMAGE}"
+          done

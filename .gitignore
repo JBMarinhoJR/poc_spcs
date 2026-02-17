@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+
+# Local credentials and env files
+snowflake_env.ps1
+.env
+.env.*
