@@ -6,11 +6,14 @@ from pathlib import Path
 
 import snowflake.connector
 
-def required(*names: str) -> str:
+def required(*names: str, default: str | None = None) -> str:
     for name in names:
         v = os.getenv(name)
         if v:
             return v
+
+    if default is not None:
+        return default
 
     if len(names) == 1:
         print(f"Missing env var: {names[0]}", file=sys.stderr)
@@ -87,17 +90,17 @@ def main():
     load_env_from_ps1(env_file)
 
     # --- Snowflake connection ---
-    account  = required("SNOWFLAKE_ACCOUNT")     # ex: MLWWZGB-YR87884
-    user     = required("SNOWFLAKE_USER")        # ex: JOHNPOC022026
-    password = required("SNOWFLAKE_PASSWORD")
-    role     = os.getenv("SNOWFLAKE_ROLE", "ACCOUNTADMIN")
+    account  = required("SNOWFLAKE_ACCOUNT", default="MLWWZGB-YR87884")
+    user     = required("SNOWFLAKE_USER", default="JOHNPOC022026")
+    password = required("SNOWFLAKE_PASSWORD", default="Poc2026@snowpark")
+    role     = required("SNOWFLAKE_ROLE", default="ACCOUNTADMIN")
 
     # --- Repo + image info ---
-    db     = required("SNOWFLAKE_DB", "POC_SPCS_DB")              # ex: POC_SPCS_DB
-    schema = required("SNOWFLAKE_SCHEMA", "POC_SPCS_SCHEMA")      # ex: POC_SPCS_SCHEMA
-    repo   = required("SNOWFLAKE_IMAGE_REPO", "POC_REPO")         # ex: POC_REPO
-    image  = args.image or required("IMAGE_NAME")                 # ex: ds-repo-docker-custom-image
-    tag    = args.tag or os.getenv("IMAGE_TAG", "py311")          # ex: py311
+    db     = required("SNOWFLAKE_DB", "POC_SPCS_DB", default="POC_SPCS_DB")
+    schema = required("SNOWFLAKE_SCHEMA", "POC_SPCS_SCHEMA", default="POC_SPCS_SCHEMA")
+    repo   = required("SNOWFLAKE_IMAGE_REPO", "POC_REPO", default="POC_REPO")
+    image  = args.image or required("IMAGE_NAME", default="ds-repo-docker-custom-image")
+    tag    = args.tag or required("IMAGE_TAG", default="py311")
 
     repo_fqn = f'"{db}"."{schema}"."{repo}"'
     repo_fqn_display = f"{db}.{schema}.{repo}"
