@@ -15,7 +15,7 @@ RUN wget https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform
 
 # Install common packages
 RUN apk add --no-cache \
-    bash coreutils git jq \
+    bash coreutils git \
     aws-cli docker-cli \
     grep sed gawk zip unzip && \
     rm -rf /var/cache/apk/*
@@ -23,14 +23,6 @@ RUN apk add --no-cache \
 # Configure pip and other tools
 RUN pip3 config set global.cert /etc/ssl/certs/ca-certificates.crt
 RUN pip3 install --no-cache-dir certifi
-
-# Install docker buildx CLI plugin
-RUN mkdir -p /usr/local/lib/docker/cli-plugins && \
-    api_url="https://api.github.com/repos/docker/buildx/releases/latest" && \
-    download_url=$(curl -fsSL "$api_url" | jq -r '.assets[] | select((.name|ascii_downcase) | test("linux.*amd64|amd64.*linux|buildx-linux-amd64|buildx-v.*linux-amd64")) | .browser_download_url' | head -n1) && \
-    test -n "$download_url" && \
-    curl -fsSL -o /usr/local/lib/docker/cli-plugins/docker-buildx "$download_url" && \
-    chmod +x /usr/local/lib/docker/cli-plugins/docker-buildx
 
 # Set environment variables
 ENV REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
