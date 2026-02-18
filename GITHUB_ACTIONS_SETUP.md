@@ -76,13 +76,22 @@ Run these SQL files in order (Snowsight Worksheet):
 
 Get `ingress_url` from the `SHOW ENDPOINTS` result and open it in your browser.
 
+Optional:
+- `spcs/setup_external_access.sql` only for public API calls from app container.
+- Trial accounts usually do not support external access integration.
+
 ## 6. What this Streamlit UI demonstrates
 
-- Login with Snowflake username/password (inside the app)
+- Caller-context/session-token authentication (no password inside app container)
 - Row-level security behavior from `APP_DEMO_ORDERS` via `CURRENT_USER()`
 - Public API data panel (crypto snapshot)
 - SPCS runtime diagnostics (container/runtime metadata)
 - SPCS metadata introspection (`SHOW ENDPOINTS`, `SHOW SERVICE CONTAINERS`)
+
+To test RLS with different users, open the ingress URL in separate browser profiles/incognito windows and login as:
+
+- `SPCS_DEMO_ALICE`
+- `SPCS_DEMO_BRUNO`
 
 ## Notes
 
