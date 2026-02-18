@@ -70,10 +70,19 @@ You should see `ds-repo-docker-custom-image:streamlit-ui`.
 
 Run these SQL files in order (Snowsight Worksheet):
 
-1. `spcs/deploy_streamlit_service.sql`
-2. `spcs/monitor_streamlit_service.sql`
+1. `spcs/setup_rls_demo.sql`
+2. `spcs/deploy_streamlit_service.sql`
+3. `spcs/monitor_streamlit_service.sql`
 
 Get `ingress_url` from the `SHOW ENDPOINTS` result and open it in your browser.
+
+## 6. What this Streamlit UI demonstrates
+
+- Login with Snowflake username/password (inside the app)
+- Row-level security behavior from `APP_DEMO_ORDERS` via `CURRENT_USER()`
+- Public API data panel (crypto snapshot)
+- SPCS runtime diagnostics (container/runtime metadata)
+- SPCS metadata introspection (`SHOW ENDPOINTS`, `SHOW SERVICE CONTAINERS`)
 
 ## Notes
 
