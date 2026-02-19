@@ -16,7 +16,7 @@ CREATE ROLE IF NOT EXISTS SPCS_STREAMLIT_VIEWER_ROLE;
 -- Optional: attach roles to your user (adjust username if needed)
 GRANT ROLE SPCS_STREAMLIT_APP_ROLE TO USER JOHNPOC022026;
 GRANT ROLE SPCS_STREAMLIT_VIEWER_ROLE TO USER JOHNPOC022026;
-GRANT ROLE SPCS_STREAMLIT_VIEWER_ROLE TO USER SPCS_DEMO_ALICE;
+GRANT ROLE SPCS_STREAMLIT_VIEWER_ROLE TO USER SPCS_DEMO_TIM;
 GRANT ROLE SPCS_STREAMLIT_VIEWER_ROLE TO USER SPCS_DEMO_BRUNO;
 
 -- Required privileges for creating a public SPCS service
@@ -54,16 +54,14 @@ CREATE COMPUTE POOL IF NOT EXISTS POC_STREAMLIT_POOL
   INITIALLY_SUSPENDED = FALSE
   AUTO_SUSPEND_SECS = 3600;
 
-CREATE OR REPLACE SERVICE POC_STREAMLIT_SERVICE
+DROP SERVICE IF EXISTS POC_STREAMLIT_SERVICE;
+CREATE  SERVICE POC_STREAMLIT_SERVICE
   IN COMPUTE POOL POC_STREAMLIT_POOL
   QUERY_WAREHOUSE = COMPUTE_WH
   MIN_INSTANCES = 1
   MAX_INSTANCES = 1
   FROM SPECIFICATION $$
 spec:
-  capabilities:
-    securityContext:
-      executeAsCaller: true
   containers:
   - name: streamlit
     image: /poc_spcs_db/poc_spcs_schema/poc_repo/ds-repo-docker-custom-image:streamlit-ui
@@ -87,6 +85,9 @@ spec:
   - name: ui
     port: 8501
     public: true
+capabilities:
+  securityContext:
+    executeAsCaller: true
 serviceRoles:
 - name: ui_role
   endpoints:
