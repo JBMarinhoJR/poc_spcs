@@ -1,4 +1,4 @@
-name: Build and Push Streamlit Image
+name: Build and Push Images
 
 on:
   push:
@@ -8,12 +8,19 @@ on:
       - Dockerfile
       - app.py
       - requirements.txt
+      - pipeline/Dockerfile
+      - pipeline/runner.py
+      - pipeline/requirements.txt
   workflow_dispatch:
     inputs:
       image_tag:
         description: "Image tag for Streamlit app"
         required: false
         default: "streamlit-ui"
+      pipeline_tag:
+        description: "Image tag for pipeline runner"
+        required: false
+        default: "pipeline"
 
 permissions:
   contents: read
@@ -111,6 +118,134 @@ jobs:
 
           echo "Smoke test for ${FULL_IMAGE}"
           docker run --rm "${FULL_IMAGE}" python -c "import streamlit; print(streamlit.__version__)"
+
+          echo "Pushing ${FULL_IMAGE}"
+          attempt=1
+          pushed=0
+          backoff="${PUSH_INITIAL_BACKOFF_SECONDS}"
+          while [ "${attempt}" -le "${PUSH_RETRIES}" ]; do
+            echo "Push attempt ${attempt}/${PUSH_RETRIES} for ${FULL_IMAGE}"
+            if docker push "${FULL_IMAGE}"; then
+              pushed=1
+              break
+            fi
+
+            echo "Push failed for ${FULL_IMAGE} (attempt ${attempt})."
+            echo "Refreshing Snowflake registry login before retry..."
+            snow spcs image-registry login -x || true
+
+            echo "Sleeping ${backoff}s before retry..."
+            sleep "${backoff}"
+            if [ "${backoff}" -lt 300 ]; then
+              backoff=$((backoff * 2))
+              if [ "${backoff}" -gt 300 ]; then
+                backoff=300
+              fi
+            fi
+            attempt=$((attempt + 1))
+          done
+
+          if [ "${pushed}" -ne 1 ]; then
+            echo "Failed to push ${FULL_IMAGE} after ${PUSH_RETRIES} attempts."
+            exit 1
+          fi
+
+          echo "Pushed ${FULL_IMAGE}"
+
+  # ---------------------------------------------------------------------------
+  build-and-push-pipeline:
+    name: Build and push pipeline runner image
+    runs-on: ubuntu-latest
+    env:
+      PIPELINE_TAG: ${{ github.event.inputs.pipeline_tag || 'pipeline' }}
+      PUSH_RETRIES: "8"
+      PUSH_INITIAL_BACKOFF_SECONDS: "20"
+      SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+      SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+      SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+      SNOWFLAKE_ROLE: ${{ secrets.SNOWFLAKE_ROLE }}
+      SNOWFLAKE_DB: ${{ secrets.SNOWFLAKE_DB }}
+      SNOWFLAKE_SCHEMA: ${{ secrets.SNOWFLAKE_SCHEMA }}
+      SNOWFLAKE_IMAGE_REPO: ${{ secrets.SNOWFLAKE_IMAGE_REPO }}
+      IMAGE_NAME: ${{ secrets.IMAGE_NAME }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Tune Docker daemon for unstable uploads
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo '{"max-concurrent-uploads": 1, "max-concurrent-downloads": 3}' | sudo tee /etc/docker/daemon.json
+          sudo systemctl restart docker
+          docker info
+
+      - name: Validate required secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          required=(
+            SNOWFLAKE_ACCOUNT
+            SNOWFLAKE_USER
+            SNOWFLAKE_PASSWORD
+            SNOWFLAKE_DB
+            SNOWFLAKE_SCHEMA
+            SNOWFLAKE_IMAGE_REPO
+            IMAGE_NAME
+          )
+          for name in "${required[@]}"; do
+            if [ -z "${!name:-}" ]; then
+              echo "Missing required secret: ${name}"
+              exit 1
+            fi
+          done
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Snowflake CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install snowflake-cli
+          snow --version
+
+      - name: Test Snowflake connection
+        shell: bash
+        run: |
+          set -euo pipefail
+          export SNOWFLAKE_ROLE="${SNOWFLAKE_ROLE:-ACCOUNTADMIN}"
+          snow connection test -x
+
+      - name: Login to Snowflake image registry
+        shell: bash
+        run: |
+          set -euo pipefail
+          export SNOWFLAKE_ROLE="${SNOWFLAKE_ROLE:-ACCOUNTADMIN}"
+          snow spcs image-registry login -x
+
+      - name: Build and push pipeline image
+        shell: bash
+        run: |
+          set -euo pipefail
+          export SNOWFLAKE_ROLE="${SNOWFLAKE_ROLE:-ACCOUNTADMIN}"
+          export DOCKER_BUILDKIT=1
+
+          SNOWFLAKE_REGISTRY_HOST="$(echo "${SNOWFLAKE_ACCOUNT}" | tr '[:upper:]' '[:lower:]').registry.snowflakecomputing.com"
+          SNOWFLAKE_REPO_URL="${SNOWFLAKE_REGISTRY_HOST}/$(echo "${SNOWFLAKE_DB}" | tr '[:upper:]' '[:lower:]')/$(echo "${SNOWFLAKE_SCHEMA}" | tr '[:upper:]' '[:lower:]')/$(echo "${SNOWFLAKE_IMAGE_REPO}" | tr '[:upper:]' '[:lower:]')"
+          FULL_IMAGE="${SNOWFLAKE_REPO_URL}/${IMAGE_NAME}:${PIPELINE_TAG}"
+
+          echo "Building ${FULL_IMAGE}"
+          docker build \
+            --pull \
+            -t "${FULL_IMAGE}" \
+            -f pipeline/Dockerfile pipeline/
+
+          echo "Smoke test for ${FULL_IMAGE}"
+          docker run --rm "${FULL_IMAGE}" python -c "import fastapi, snowflake.connector; print('OK')"
 
           echo "Pushing ${FULL_IMAGE}"
           attempt=1

@@ -1,0 +1,261 @@
+name: SQL CI/CD — Validate & Deploy Migrations
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "spcs/migrations/**.sql"
+  workflow_dispatch:
+    inputs:
+      migration_file:
+        description: "Specific migration file to deploy (relative path, e.g. spcs/migrations/20260301_120000_add_index.sql). Leave blank to auto-detect from last commit."
+        required: false
+        default: ""
+      dry_run:
+        description: "Validate only — do not deploy"
+        required: false
+        default: "false"
+        type: choice
+        options: ["false", "true"]
+
+env:
+  SNOWFLAKE_ACCOUNT:    ${{ secrets.SNOWFLAKE_ACCOUNT }}
+  SNOWFLAKE_USER:       ${{ secrets.SNOWFLAKE_USER }}
+  SNOWFLAKE_PASSWORD:   ${{ secrets.SNOWFLAKE_PASSWORD }}
+  SNOWFLAKE_ROLE:       ${{ secrets.SNOWFLAKE_ROLE }}
+  SNOWFLAKE_DB:         ${{ secrets.SNOWFLAKE_DB }}
+  SNOWFLAKE_SCHEMA:     ${{ secrets.SNOWFLAKE_SCHEMA }}
+  PIPELINE_SERVICE:     "POC_PIPELINE_SERVICE"
+  DRY_RUN:             ${{ github.event.inputs.dry_run || 'false' }}
+
+jobs:
+  sql-cicd:
+    name: Validate & Deploy SQL Migrations
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # needed to commit audit logs back to the repo
+
+    steps:
+      # -----------------------------------------------------------------------
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2   # need HEAD~1 to detect changed files
+
+      # -----------------------------------------------------------------------
+      - name: Validate required secrets
+        run: |
+          missing=()
+          for secret in \
+            SNOWFLAKE_ACCOUNT SNOWFLAKE_USER SNOWFLAKE_PASSWORD \
+            SNOWFLAKE_ROLE SNOWFLAKE_DB SNOWFLAKE_SCHEMA; do
+            val=$(eval echo "\$$secret")
+            if [ -z "$val" ]; then
+              missing+=("$secret")
+            fi
+          done
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "ERROR: Missing required secrets: ${missing[*]}"
+            exit 1
+          fi
+          echo "All required secrets present."
+
+      # -----------------------------------------------------------------------
+      - name: Detect changed migration files
+        id: detect
+        run: |
+          if [ -n "${{ github.event.inputs.migration_file }}" ]; then
+            CHANGED="${{ github.event.inputs.migration_file }}"
+          else
+            CHANGED=$(git diff --name-only HEAD~1 HEAD -- 'spcs/migrations/*.sql' | tr '\n' ' ')
+          fi
+
+          if [ -z "$CHANGED" ]; then
+            echo "No SQL migration files changed. Skipping."
+            echo "files=" >> "$GITHUB_OUTPUT"
+          else
+            echo "Changed migration files: $CHANGED"
+            echo "files=$CHANGED" >> "$GITHUB_OUTPUT"
+          fi
+
+      # -----------------------------------------------------------------------
+      - name: Setup Python
+        if: steps.detect.outputs.files != ''
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # -----------------------------------------------------------------------
+      - name: Install Snowflake CLI
+        if: steps.detect.outputs.files != ''
+        run: pip install --quiet snowflake-cli-labs==3.2.0
+
+      # -----------------------------------------------------------------------
+      - name: Write Snowflake CLI config
+        if: steps.detect.outputs.files != ''
+        run: |
+          mkdir -p ~/.config/snowflake
+          cat > ~/.config/snowflake/config.toml << EOF
+          [connections.default]
+          account     = "${SNOWFLAKE_ACCOUNT}"
+          user        = "${SNOWFLAKE_USER}"
+          password    = "${SNOWFLAKE_PASSWORD}"
+          role        = "${SNOWFLAKE_ROLE}"
+          database    = "${SNOWFLAKE_DB}"
+          schema      = "${SNOWFLAKE_SCHEMA}"
+          warehouse   = "COMPUTE_WH"
+          EOF
+
+      # -----------------------------------------------------------------------
+      - name: Test Snowflake connection
+        if: steps.detect.outputs.files != ''
+        run: snow connection test -x
+
+      # -----------------------------------------------------------------------
+      - name: Get pipeline service endpoint URL
+        if: steps.detect.outputs.files != ''
+        id: endpoint
+        run: |
+          # Retrieve the internal ingress URL for POC_PIPELINE_SERVICE
+          ENDPOINT_JSON=$(snow spcs service list-endpoints "$PIPELINE_SERVICE" --format json -x 2>/dev/null || echo "[]")
+          PIPELINE_URL=$(echo "$ENDPOINT_JSON" | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          for ep in data:
+              if ep.get('name','').lower() == 'api':
+                  url = ep.get('ingress_url','')
+                  if url:
+                      print('https://' + url.lstrip('https://'))
+                      break
+          " 2>/dev/null || echo "")
+
+          if [ -z "$PIPELINE_URL" ]; then
+            echo "ERROR: Could not retrieve pipeline service URL."
+            echo "Make sure POC_PIPELINE_SERVICE is running (deploy_pipeline_service.sql)."
+            exit 1
+          fi
+
+          echo "Pipeline service URL: $PIPELINE_URL"
+          echo "url=$PIPELINE_URL" >> "$GITHUB_OUTPUT"
+
+      # -----------------------------------------------------------------------
+      - name: Validate & deploy migrations
+        if: steps.detect.outputs.files != ''
+        id: deploy
+        env:
+          PIPELINE_URL: ${{ steps.endpoint.outputs.url }}
+          GIT_SHA: ${{ github.sha }}
+        run: |
+          FAILED=0
+          DEPLOYED_FILES=""
+
+          for filepath in ${{ steps.detect.outputs.files }}; do
+            filename=$(basename "$filepath")
+            echo ""
+            echo "======================================================="
+            echo "Processing: $filename"
+            echo "======================================================="
+
+            SQL_CONTENT=$(cat "$filepath")
+
+            # --- Validate ---
+            echo "→ Validating..."
+            VAL_RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+              "$PIPELINE_URL/validate" \
+              -H "Content-Type: application/json" \
+              -d "$(python3 -c "
+          import json, sys
+          print(json.dumps({'migration_file': '$filename', 'sql_content': open('$filepath').read(), 'git_sha': '$GIT_SHA'}))
+          ")")
+
+            HTTP_CODE=$(echo "$VAL_RESPONSE" | tail -1)
+            VAL_BODY=$(echo "$VAL_RESPONSE" | head -n -1)
+
+            if [ "$HTTP_CODE" != "200" ]; then
+              echo "ERROR: Validation request failed (HTTP $HTTP_CODE): $VAL_BODY"
+              FAILED=1
+              continue
+            fi
+
+            VALID=$(echo "$VAL_BODY" | python3 -c "import sys,json; d=json.load(sys.stdin); print(str(d.get('valid',False)).lower())")
+            if [ "$VALID" != "true" ]; then
+              ERRORS=$(echo "$VAL_BODY" | python3 -c "import sys,json; d=json.load(sys.stdin); print('\n'.join(d.get('errors',[])))")
+              echo "VALIDATION FAILED:"
+              echo "$ERRORS"
+              FAILED=1
+              continue
+            fi
+            echo "  Validation passed."
+
+            # --- Deploy (skip if dry run) ---
+            if [ "$DRY_RUN" = "true" ]; then
+              echo "  DRY_RUN=true — skipping deployment."
+              continue
+            fi
+
+            echo "→ Deploying..."
+            DEPLOY_RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+              "$PIPELINE_URL/deploy" \
+              -H "Content-Type: application/json" \
+              -d "$(python3 -c "
+          import json, sys
+          print(json.dumps({'migration_file': '$filename', 'sql_content': open('$filepath').read(), 'git_sha': '$GIT_SHA'}))
+          ")")
+
+            HTTP_CODE=$(echo "$DEPLOY_RESPONSE" | tail -1)
+            DEPLOY_BODY=$(echo "$DEPLOY_RESPONSE" | head -n -1)
+
+            if [ "$HTTP_CODE" != "200" ]; then
+              echo "ERROR: Deploy request failed (HTTP $HTTP_CODE): $DEPLOY_BODY"
+              FAILED=1
+              continue
+            fi
+
+            DEPLOYED=$(echo "$DEPLOY_BODY" | python3 -c "import sys,json; d=json.load(sys.stdin); print(str(d.get('deployed',False)).lower())")
+            if [ "$DEPLOYED" != "true" ]; then
+              ERRORS=$(echo "$DEPLOY_BODY" | python3 -c "import sys,json; d=json.load(sys.stdin); print('\n'.join(d.get('errors',[])))")
+              echo "DEPLOYMENT FAILED:"
+              echo "$ERRORS"
+              FAILED=1
+              continue
+            fi
+
+            echo "  Deployed successfully."
+            DEPLOYED_FILES="$DEPLOYED_FILES $filename"
+          done
+
+          echo "deployed_files=$DEPLOYED_FILES" >> "$GITHUB_OUTPUT"
+
+          if [ "$FAILED" -ne 0 ]; then
+            echo ""
+            echo "One or more migrations failed. See errors above."
+            exit 1
+          fi
+
+      # -----------------------------------------------------------------------
+      - name: Commit audit logs to git
+        if: steps.detect.outputs.files != '' && steps.deploy.outputs.deployed_files != '' && env.DRY_RUN == 'false'
+        env:
+          PIPELINE_URL: ${{ steps.endpoint.outputs.url }}
+          GIT_SHA: ${{ github.sha }}
+        run: |
+          mkdir -p spcs/audit
+          DATE_PREFIX=$(date -u +%Y%m%d_%H%M%S)
+
+          for filename in ${{ steps.deploy.outputs.deployed_files }}; do
+            echo "Fetching audit entry for: $filename"
+            AUDIT=$(curl -s "$PIPELINE_URL/audit/$filename")
+            OUTFILE="spcs/audit/${DATE_PREFIX}_${filename%.sql}.json"
+            echo "$AUDIT" > "$OUTFILE"
+            echo "  Written: $OUTFILE"
+          done
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add spcs/audit/
+          if git diff --cached --quiet; then
+            echo "No audit files to commit."
+          else
+            git commit -m "ci: audit log for migrations deployed at $DATE_PREFIX [skip ci]"
+            git push
+          fi
