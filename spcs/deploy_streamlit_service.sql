@@ -60,6 +60,8 @@ CREATE  SERVICE POC_STREAMLIT_SERVICE
   QUERY_WAREHOUSE = COMPUTE_WH
   MIN_INSTANCES = 1
   MAX_INSTANCES = 1
+  -- Requires spcs/setup_external_access.sql (SPCS_APP_EAI).
+  EXTERNAL_ACCESS_INTEGRATIONS = (SPCS_APP_EAI)
   FROM SPECIFICATION $$
 spec:
   containers:
@@ -78,6 +80,10 @@ spec:
       SPCS_SERVICE_DB: "POC_SPCS_DB"
       SPCS_SERVICE_SCHEMA: "POC_SPCS_SCHEMA"
       SPCS_SERVICE_NAME: "POC_STREAMLIT_SERVICE"
+      GITHUB_REPO: "JBMarinhoJR/poc_spcs"
+      GITHUB_BRANCH: "main"
+      GITHUB_MIGRATIONS_DIR: "spcs/migrations"
+      GITHUB_WORKFLOW_FILE: "sql-cicd.yml"
     readinessProbe:
       port: 8501
       path: /_stcore/health

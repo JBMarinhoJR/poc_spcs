@@ -116,7 +116,7 @@ jobs:
         if: steps.detect.outputs.files != ''
         id: endpoint
         run: |
-          # Retrieve the internal ingress URL for POC_PIPELINE_SERVICE
+          # Retrieve the service ingress URL for POC_PIPELINE_SERVICE (requires public endpoint)
           ENDPOINT_JSON=$(snow spcs service list-endpoints "$PIPELINE_SERVICE" --format json -x 2>/dev/null || echo "[]")
           PIPELINE_URL=$(echo "$ENDPOINT_JSON" | python3 -c "
           import sys, json

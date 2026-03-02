@@ -1,3 +1,4 @@
+import base64
 import os
 import platform
 from datetime import datetime, timezone
@@ -56,6 +57,12 @@ APP_CONFIG = {
     "service_database": env_or_default("SPCS_SERVICE_DB", "POC_SPCS_DB"),
     "service_schema": env_or_default("SPCS_SERVICE_SCHEMA", "POC_SPCS_SCHEMA"),
     "service_name": env_or_default("SPCS_SERVICE_NAME", "POC_STREAMLIT_SERVICE"),
+    "github_repo": env_or_default("GITHUB_REPO", "JBMarinhoJR/poc_spcs"),
+    "github_branch": env_or_default("GITHUB_BRANCH", "main"),
+    "github_migrations_dir": env_or_default(
+        "GITHUB_MIGRATIONS_DIR", "spcs/migrations"
+    ),
+    "github_workflow_file": env_or_default("GITHUB_WORKFLOW_FILE", "sql-cicd.yml"),
     "allow_password_login": env_bool("ALLOW_PASSWORD_LOGIN", False),
 }
 
@@ -181,6 +188,92 @@ def fetch_market_snapshot() -> dict:
         }
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
+
+
+def github_headers(token: str) -> dict:
+    return {
+        "Accept": "application/vnd.github+json",
+        "Authorization": f"Bearer {token}",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+
+def github_get_file_sha(token: str, repo: str, path: str, branch: str):
+    url = f"https://api.github.com/repos/{repo}/contents/{path}"
+    try:
+        response = requests.get(
+            url,
+            headers=github_headers(token),
+            params={"ref": branch},
+            timeout=15,
+        )
+    except Exception as exc:
+        return None, f"GitHub request failed: {exc}"
+
+    if response.status_code == 200:
+        payload = response.json()
+        return payload.get("sha"), None
+    if response.status_code == 404:
+        return None, None
+
+    try:
+        payload = response.json()
+        message = payload.get("message", response.text)
+    except Exception:
+        message = response.text
+    return None, f"GitHub API error ({response.status_code}): {message}"
+
+
+def github_upsert_file(
+    token: str,
+    repo: str,
+    branch: str,
+    file_path: str,
+    content_text: str,
+    commit_message: str,
+):
+    sha, error = github_get_file_sha(token, repo, file_path, branch)
+    if error:
+        return False, error, None
+
+    url = f"https://api.github.com/repos/{repo}/contents/{file_path}"
+    payload = {
+        "message": commit_message,
+        "content": base64.b64encode(content_text.encode("utf-8")).decode("ascii"),
+        "branch": branch,
+    }
+    if sha:
+        payload["sha"] = sha
+
+    try:
+        response = requests.put(
+            url,
+            headers=github_headers(token),
+            json=payload,
+            timeout=20,
+        )
+    except Exception as exc:
+        return False, f"GitHub request failed: {exc}", None
+
+    if response.status_code not in (200, 201):
+        try:
+            err_payload = response.json()
+            message = err_payload.get("message", response.text)
+        except Exception:
+            message = response.text
+        return False, f"GitHub API error ({response.status_code}): {message}", None
+
+    try:
+        res_payload = response.json()
+        file_url = res_payload.get("content", {}).get("html_url")
+        return True, "", file_url
+    except Exception:
+        return True, "", None
+
+
+def default_migration_filename() -> str:
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    return f"{stamp}_new_migration.sql"
 
 
 def show_header():
@@ -344,6 +437,115 @@ def show_spcs_panel(conn):
         st.info(f"Service metadata not available for this user/role: {exc}")
 
 
+def show_sql_upload_panel():
+    st.subheader("SQL CI/CD Upload")
+    st.caption(
+        "Upload a .sql file and commit directly to GitHub path "
+        f"`{APP_CONFIG['github_migrations_dir']}` to trigger the SQL CI/CD workflow."
+    )
+
+    default_repo = APP_CONFIG["github_repo"]
+    default_branch = APP_CONFIG["github_branch"]
+    default_dir = APP_CONFIG["github_migrations_dir"]
+    default_workflow = APP_CONFIG["github_workflow_file"]
+
+    with st.form("github_upload_form", clear_on_submit=False):
+        c1, c2 = st.columns(2)
+        repo = c1.text_input("GitHub repo (owner/repo)", value=default_repo).strip()
+        branch = c2.text_input("Branch", value=default_branch).strip() or "main"
+
+        c3, c4 = st.columns(2)
+        migrations_dir = c3.text_input("Migrations folder", value=default_dir).strip()
+        workflow_file = c4.text_input(
+            "Workflow filename", value=default_workflow
+        ).strip()
+
+        migration_filename = st.text_input(
+            "Migration filename",
+            value=default_migration_filename(),
+            help="Final path: <migrations folder>/<migration filename>",
+        ).strip()
+
+        uploaded_file = st.file_uploader("SQL file", type=["sql"])
+
+        env_token = os.getenv("GITHUB_TOKEN", "").strip()
+        use_env_token = False
+        if env_token:
+            use_env_token = st.checkbox(
+                "Use GITHUB_TOKEN from container environment",
+                value=True,
+            )
+
+        token = env_token if use_env_token else st.text_input(
+            "GitHub Personal Access Token (contents: write)",
+            type="password",
+            value="",
+        )
+
+        commit_message = st.text_input(
+            "Commit message", value=f"feat(sql): add {migration_filename or 'migration'}"
+        ).strip()
+
+        submit = st.form_submit_button("Upload To GitHub", use_container_width=True)
+
+    if not submit:
+        return
+
+    if not repo or "/" not in repo:
+        st.error("Invalid repository. Use format owner/repo.")
+        return
+    if not migrations_dir:
+        st.error("Migrations folder is required.")
+        return
+    if not migration_filename:
+        st.error("Migration filename is required.")
+        return
+    if not migration_filename.lower().endswith(".sql"):
+        st.error("Migration filename must end with .sql.")
+        return
+    if uploaded_file is None:
+        st.error("Please upload a .sql file.")
+        return
+    if not token:
+        st.error("GitHub token is required.")
+        return
+
+    try:
+        sql_content = uploaded_file.getvalue().decode("utf-8")
+    except UnicodeDecodeError:
+        st.error("File must be UTF-8 encoded.")
+        return
+    if not sql_content.strip():
+        st.error("SQL file is empty.")
+        return
+
+    full_path = f"{migrations_dir.strip('/')}/{migration_filename}"
+    with st.spinner("Committing migration file to GitHub..."):
+        ok, error, file_url = github_upsert_file(
+            token=token,
+            repo=repo,
+            branch=branch,
+            file_path=full_path,
+            content_text=sql_content,
+            commit_message=commit_message or f"feat(sql): add {migration_filename}",
+        )
+
+    if not ok:
+        st.error(error)
+        st.info(
+            "If this is a network error inside SPCS, add `api.github.com:443` to "
+            "your external access network rule."
+        )
+        return
+
+    st.success(f"File committed: {full_path}")
+    if file_url:
+        st.markdown(f"[Open committed file]({file_url})")
+
+    workflow_url = f"https://github.com/{repo}/actions/workflows/{workflow_file}"
+    st.markdown(f"[Open SQL CI/CD workflow runs]({workflow_url})")
+
+
 def show_connect_error():
     err = st.session_state.get("spcs_connect_error")
     if not err:
@@ -391,11 +593,16 @@ def main():
                 st.session_state.pop(key, None)
             st.rerun()
 
-    show_runtime_panel()
-    show_api_panel()
-    show_session_panel(conn)
-    show_rls_panel(conn)
-    show_spcs_panel(conn)
+    demo_tab, upload_tab = st.tabs(["SPCS Demo", "SQL CI/CD Upload"])
+    with demo_tab:
+        show_runtime_panel()
+        show_api_panel()
+        show_session_panel(conn)
+        show_rls_panel(conn)
+        show_spcs_panel(conn)
+
+    with upload_tab:
+        show_sql_upload_panel()
 
 
 if __name__ == "__main__":

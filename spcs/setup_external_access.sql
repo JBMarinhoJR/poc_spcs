@@ -2,6 +2,7 @@
 -- Enable outbound egress from SPCS service to:
 -- 1) Snowflake account hostname (for username/password connector login)
 -- 2) CoinGecko API (public API panel in Streamlit app)
+-- 3) GitHub API (upload SQL migrations from Streamlit UI)
 --
 -- Execute as ACCOUNTADMIN.
 
@@ -14,7 +15,8 @@ CREATE OR REPLACE NETWORK RULE SPCS_APP_EGRESS_RULE
   TYPE = HOST_PORT
   VALUE_LIST = (
     'mlwwzgb-yr87884.snowflakecomputing.com:443',
-    'api.coingecko.com:443'
+    'api.coingecko.com:443',
+    'api.github.com:443'
   );
 
 CREATE OR REPLACE EXTERNAL ACCESS INTEGRATION SPCS_APP_EAI

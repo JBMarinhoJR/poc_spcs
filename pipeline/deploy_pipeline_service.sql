@@ -60,7 +60,7 @@ CREATE COMPUTE POOL IF NOT EXISTS POC_PIPELINE_POOL
 -- Wait for compute pool to be IDLE before creating service
 -- (run DESCRIBE COMPUTE POOL POC_PIPELINE_POOL until state = IDLE)
 
--- Pipeline runner service — internal endpoint (not public)
+-- Pipeline runner service — public endpoint (required for GitHub-hosted Actions to call /validate and /deploy)
 DROP SERVICE IF EXISTS POC_PIPELINE_SERVICE;
 CREATE SERVICE POC_PIPELINE_SERVICE
     IN COMPUTE POOL POC_PIPELINE_POOL
@@ -83,7 +83,7 @@ spec:
   endpoints:
   - name: api
     port: 8080
-    public: false
+    public: true
 $$ ;
 
 -- =============================================================================
@@ -94,6 +94,10 @@ SHOW SERVICES LIKE 'POC_PIPELINE_SERVICE';
 SHOW SERVICE CONTAINERS IN SERVICE POC_PIPELINE_SERVICE;
 SHOW ENDPOINTS IN SERVICE POC_PIPELINE_SERVICE;
 
--- Get the internal DNS name for use in GitHub Actions
--- Format: <service>.<schema>.<db>.snowflakecomputing.internal
-SELECT SYSTEM$GET_SERVICE_DNS_DOMAIN('POC_SPCS_DB', 'POC_SPCS_SCHEMA', 'POC_PIPELINE_SERVICE');
+-- Get schema DNS domain for internal service addressing.
+-- Combine with service + endpoint when needed:
+--   <service>.<endpoint>.<schema_dns_domain>
+-- NOTE: this helper can fail in some account contexts/extensions.
+-- Use the dns_name column from SHOW SERVICES as the source of truth.
+-- Optional:
+-- SELECT SYSTEM$GET_SERVICE_DNS_DOMAIN('POC_SPCS_DB.POC_SPCS_SCHEMA') AS schema_dns_domain;
