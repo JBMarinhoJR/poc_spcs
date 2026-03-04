@@ -1,6 +1,7 @@
 import base64
 import os
 import platform
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -68,6 +69,45 @@ APP_CONFIG = {
 
 SERVICE_TOKEN_PATH = Path("/snowflake/session/token")
 
+# ── SQL Pipeline: constants ───────────────────────────────────────────────────
+
+APPROVER1_MOCK_PASSWORD = "Approver123!"
+
+AUDIT_TABLE = (
+    f"{APP_CONFIG['default_database']}.{APP_CONFIG['default_schema']}.PIPELINE_AUDIT_LOG"
+)
+APPROVALS_TABLE = (
+    f"{APP_CONFIG['default_database']}.{APP_CONFIG['default_schema']}.CICD_APPROVALS"
+)
+
+# Ordered: more specific patterns first
+_CMD_PATTERNS: list[tuple[str, str]] = [
+    (r"^CREATE\s+OR\s+REPLACE\s+TABLE",    "CREATE TABLE"),
+    (r"^CREATE\s+TABLE",                   "CREATE TABLE"),
+    (r"^CREATE\s+OR\s+REPLACE\s+VIEW",     "CREATE VIEW"),
+    (r"^CREATE\s+VIEW",                    "CREATE VIEW"),
+    (r"^CREATE\s+OR\s+REPLACE\s+SCHEMA",   "CREATE SCHEMA"),
+    (r"^CREATE\s+SCHEMA",                  "CREATE SCHEMA"),
+    (r"^CREATE\s+OR\s+REPLACE\s+DATABASE", "CREATE DATABASE"),
+    (r"^CREATE\s+DATABASE",                "CREATE DATABASE"),
+    (r"^CREATE\s+OR\s+REPLACE\s+\w+",     "CREATE OTHER"),
+    (r"^CREATE\s+\w+",                     "CREATE OTHER"),
+    (r"^ALTER\s+TABLE",                    "ALTER TABLE"),
+    (r"^ALTER\s+",                         "ALTER OTHER"),
+    (r"^DROP\s+TABLE",                     "DROP TABLE"),
+    (r"^DROP\s+VIEW",                      "DROP VIEW"),
+    (r"^DROP\s+",                          "DROP OTHER"),
+    (r"^INSERT\s+",                        "INSERT"),
+    (r"^UPDATE\s+",                        "UPDATE"),
+    (r"^DELETE\s+",                        "DELETE"),
+    (r"^MERGE\s+",                         "MERGE"),
+    (r"^GRANT\s+",                         "GRANT"),
+    (r"^REVOKE\s+",                        "REVOKE"),
+    (r"^SELECT\s+",                        "SELECT"),
+    (r"^CALL\s+",                          "CALL"),
+    (r"^USE\s+",                           "USE"),
+]
+
 
 def get_state(name: str, default):
     if name not in st.session_state:
@@ -84,6 +124,98 @@ def run_df(conn, sql: str) -> pd.DataFrame:
         return pd.DataFrame(rows, columns=cols)
     finally:
         cur.close()
+
+
+# ── SQL Pipeline: parsing helpers ────────────────────────────────────────────
+
+
+def _strip_sql_comments(sql: str) -> str:
+    sql = re.sub(r"/\*.*?\*/", " ", sql, flags=re.DOTALL)
+    sql = re.sub(r"--[^\n]*", " ", sql)
+    return sql
+
+
+def _split_statements(sql: str) -> list[str]:
+    cleaned = _strip_sql_comments(sql)
+    parts = cleaned.split(";")
+    return [s.strip() for s in parts if s.strip()]
+
+
+def _detect_command_type(stmt: str) -> str:
+    for pattern, label in _CMD_PATTERNS:
+        if re.match(pattern, stmt.strip(), re.IGNORECASE):
+            return label
+    return "UNKNOWN"
+
+
+def _extract_object_name(stmt: str, cmd_type: str) -> str | None:
+    extractable = {
+        "CREATE TABLE", "CREATE VIEW", "CREATE SCHEMA",
+        "CREATE DATABASE", "ALTER TABLE", "DROP TABLE", "DROP VIEW",
+    }
+    if cmd_type not in extractable:
+        return None
+    cleaned = re.sub(
+        r"^(CREATE\s+(OR\s+REPLACE\s+)?|ALTER\s+|DROP\s+)"
+        r"(TABLE|VIEW|SCHEMA|DATABASE)\s+"
+        r"(IF\s+(NOT\s+)?EXISTS\s+)?",
+        "",
+        stmt.strip(),
+        flags=re.IGNORECASE,
+    )
+    match = re.match(r'([".\w]+)', cleaned.strip())
+    if match:
+        return match.group(1).strip('"').split("(")[0].strip()
+    return None
+
+
+def _check_object_exists(conn, cmd_type: str, obj_name: str | None) -> str:
+    checkable = {"CREATE TABLE", "CREATE VIEW", "CREATE SCHEMA", "CREATE DATABASE"}
+    if cmd_type not in checkable or obj_name is None:
+        return "N/A"
+
+    db = APP_CONFIG["default_database"]
+    schema = APP_CONFIG["default_schema"]
+    parts = obj_name.split(".")
+    bare = parts[-1]
+    if len(parts) == 3:
+        db, schema, bare = parts
+    elif len(parts) == 2:
+        schema, bare = parts
+
+    try:
+        cur = conn.cursor()
+        if cmd_type == "CREATE TABLE":
+            cur.execute(f"SHOW TABLES LIKE '{bare}' IN SCHEMA {db}.{schema}")
+        elif cmd_type == "CREATE VIEW":
+            cur.execute(f"SHOW VIEWS LIKE '{bare}' IN SCHEMA {db}.{schema}")
+        elif cmd_type == "CREATE SCHEMA":
+            cur.execute(f"SHOW SCHEMAS LIKE '{bare}' IN DATABASE {db}")
+        elif cmd_type == "CREATE DATABASE":
+            cur.execute(f"SHOW DATABASES LIKE '{bare}'")
+        rows = cur.fetchall()
+        cur.close()
+        return "Yes" if rows else "No"
+    except Exception:
+        return "N/A"
+
+
+def parse_sql_file(conn, sql_content: str) -> list[dict]:
+    results = []
+    for i, stmt in enumerate(_split_statements(sql_content), start=1):
+        cmd = _detect_command_type(stmt)
+        obj = _extract_object_name(stmt, cmd)
+        exists = _check_object_exists(conn, cmd, obj)
+        results.append(
+            {
+                "stmt_num": i,
+                "command_type": cmd,
+                "object_name": obj,
+                "exists_in_sf": exists,
+                "statement": stmt,
+            }
+        )
+    return results
 
 
 def get_request_header(header_name: str) -> str:
@@ -269,6 +401,84 @@ def github_upsert_file(
         return True, "", file_url
     except Exception:
         return True, "", None
+
+
+# ── SQL Pipeline: DB helpers ──────────────────────────────────────────────────
+
+
+def ensure_pipeline_tables(conn) -> None:
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {APPROVALS_TABLE} (
+                id             NUMBER AUTOINCREMENT PRIMARY KEY,
+                migration_file VARCHAR(255)  NOT NULL,
+                approved_by    VARCHAR(100)  NOT NULL,
+                approved_at    TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+                status         VARCHAR(20)   NOT NULL,
+                comments       TEXT
+            )
+            """
+        )
+    finally:
+        cur.close()
+
+
+def insert_audit_log(
+    conn,
+    migration_file: str,
+    status: str,
+    sql_content: str,
+    error_message: str,
+    git_sha: str = "",
+) -> None:
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            f"""
+            INSERT INTO {AUDIT_TABLE}
+                (migration_file, status, executed_by, sql_content, error_message, git_sha)
+            SELECT %s, %s, CURRENT_USER(), %s, %s, %s
+            """,
+            (migration_file, status, sql_content, error_message or "", git_sha),
+        )
+        cur.close()
+    except Exception as exc:
+        st.warning(f"Could not write audit log: {exc}")
+
+
+def insert_approval(
+    conn,
+    migration_file: str,
+    approved_by: str,
+    status: str,
+    comments: str,
+) -> None:
+    cur = conn.cursor()
+    cur.execute(
+        f"""
+        INSERT INTO {APPROVALS_TABLE}
+            (migration_file, approved_by, status, comments)
+        VALUES (%s, %s, %s, %s)
+        """,
+        (migration_file, approved_by, status, comments or ""),
+    )
+    cur.close()
+
+
+def get_approval_status(conn, migration_file: str) -> pd.DataFrame:
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            f"SELECT * FROM {APPROVALS_TABLE} WHERE migration_file = %s ORDER BY approved_at DESC",
+            (migration_file,),
+        )
+        cols = [c[0] for c in cur.description]
+        rows = cur.fetchall()
+        return pd.DataFrame(rows, columns=cols)
+    finally:
+        cur.close()
 
 
 def default_migration_filename() -> str:
@@ -546,6 +756,199 @@ def show_sql_upload_panel():
     st.markdown(f"[Open SQL CI/CD workflow runs]({workflow_url})")
 
 
+# ── SQL Pipeline: UI renderers ────────────────────────────────────────────────
+
+_DDL_TYPES = {
+    "CREATE TABLE", "CREATE VIEW", "CREATE SCHEMA", "CREATE DATABASE",
+    "CREATE OTHER", "ALTER TABLE", "ALTER OTHER",
+    "DROP TABLE", "DROP VIEW", "DROP OTHER",
+}
+_DML_TYPES = {"INSERT", "UPDATE", "DELETE", "MERGE"}
+
+
+def _render_file_metrics(conn) -> None:
+    st.subheader("SQL File Analysis")
+    uploaded = st.file_uploader("Upload a .sql file", type=["sql"], key="pipeline_uploader")
+    if uploaded is None:
+        st.info("Upload a .sql file to begin.")
+        return
+
+    try:
+        sql_content = uploaded.getvalue().decode("utf-8")
+    except UnicodeDecodeError:
+        st.error("File must be UTF-8 encoded.")
+        return
+
+    filename = uploaded.name
+    st.session_state["pipeline_filename"] = filename
+    st.session_state["pipeline_sql_content"] = sql_content
+    st.session_state["pipeline_approved"] = False  # reset on new upload
+
+    with st.spinner("Parsing and checking objects in Snowflake…"):
+        parsed = parse_sql_file(conn, sql_content)
+    st.session_state["pipeline_parsed"] = parsed
+
+    if not parsed:
+        st.warning("No SQL statements found in the file.")
+        return
+
+    total = len(parsed)
+    grants = sum(1 for r in parsed if r["command_type"] == "GRANT")
+    ddl = sum(1 for r in parsed if r["command_type"] in _DDL_TYPES)
+    dml = sum(1 for r in parsed if r["command_type"] in _DML_TYPES)
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total Statements", total)
+    c2.metric("GRANTs", grants)
+    c3.metric("DDL", ddl)
+    c4.metric("DML", dml)
+
+    display_rows = [
+        {
+            "#": r["stmt_num"],
+            "Command Type": r["command_type"],
+            "Object Name": r["object_name"] or "—",
+            "Exists in SF": r["exists_in_sf"],
+        }
+        for r in parsed
+    ]
+    st.dataframe(pd.DataFrame(display_rows), use_container_width=True, hide_index=True)
+
+
+def _render_approver1(conn) -> None:
+    st.subheader("Approver-1 Review")
+
+    migration_file = st.session_state.get("pipeline_filename")
+    sql_content = st.session_state.get("pipeline_sql_content")
+    if not migration_file or not sql_content:
+        st.warning("Upload a SQL file in the 'File Metrics' tab first.")
+        return
+
+    approval_df = get_approval_status(conn, migration_file)
+    if not approval_df.empty:
+        st.write("Approval records:")
+        st.dataframe(approval_df, use_container_width=True, hide_index=True)
+        latest_status = approval_df.iloc[0]["STATUS"]
+        if latest_status == "APPROVED":
+            st.session_state["pipeline_approved"] = True
+            st.success("This migration is already APPROVED. Proceed to Deploy.")
+    else:
+        st.info(f"No approval record yet for `{migration_file}`.")
+
+    st.markdown("---")
+    st.write(f"Reviewing: `{migration_file}`")
+    with st.expander("View SQL Content", expanded=False):
+        st.code(sql_content, language="sql")
+
+    with st.form("approver1_form"):
+        mock_password = st.text_input(
+            "Approver-1 Password",
+            type="password",
+            help="Mock credential for PoC.",
+        )
+        comments = st.text_area("Comments (optional)")
+        col_approve, col_reject = st.columns(2)
+        approve_clicked = col_approve.form_submit_button("Approve", use_container_width=True)
+        reject_clicked = col_reject.form_submit_button("Reject", use_container_width=True)
+
+    if approve_clicked or reject_clicked:
+        if mock_password != APPROVER1_MOCK_PASSWORD:
+            st.error("Incorrect Approver-1 password.")
+            return
+        action = "APPROVED" if approve_clicked else "REJECTED"
+        insert_approval(conn, migration_file, "APPROVER1", action, comments)
+        if action == "APPROVED":
+            st.session_state["pipeline_approved"] = True
+            st.success("Migration APPROVED. Switch to the Deploy tab.")
+        else:
+            st.session_state["pipeline_approved"] = False
+            st.warning("Migration REJECTED.")
+        st.rerun()
+
+
+def _render_deploy(conn) -> None:
+    st.subheader("Deploy Migration")
+
+    migration_file = st.session_state.get("pipeline_filename")
+    sql_content = st.session_state.get("pipeline_sql_content")
+    approved = st.session_state.get("pipeline_approved", False)
+
+    if not migration_file or not sql_content:
+        st.warning("Upload a SQL file in the 'File Metrics' tab first.")
+        return
+
+    if not approved:
+        st.error("Migration must be approved in 'Approver-1' before deploying.")
+        st.stop()
+
+    st.success("Migration is approved. Review and confirm before deploying.")
+    with st.expander("SQL Content", expanded=True):
+        st.code(sql_content, language="sql")
+
+    confirmed = st.checkbox("I confirm I want to execute this migration against Snowflake.")
+    deploy_btn = st.button("Deploy Now", disabled=not confirmed, use_container_width=True)
+
+    if not deploy_btn:
+        return
+
+    statements = _split_statements(_strip_sql_comments(sql_content))
+    results = []
+    all_ok = True
+    error_messages = []
+
+    with st.spinner("Executing migration…"):
+        cur = conn.cursor()
+        for i, stmt in enumerate(statements, start=1):
+            try:
+                cur.execute(stmt)
+                results.append({"stmt_num": i, "preview": stmt[:120], "ok": True, "error": ""})
+            except Exception as exc:
+                err = str(exc)
+                results.append({"stmt_num": i, "preview": stmt[:120], "ok": False, "error": err})
+                error_messages.append(f"Stmt {i}: {err}")
+                all_ok = False
+                break
+        cur.close()
+
+    final_status = "DEPLOYED" if all_ok else "FAILED"
+    insert_audit_log(
+        conn,
+        migration_file=migration_file,
+        status=final_status,
+        sql_content=sql_content,
+        error_message="; ".join(error_messages) if error_messages else "",
+    )
+
+    st.write("### Execution Results")
+    for r in results:
+        preview = r["preview"] + ("…" if len(r["preview"]) == 120 else "")
+        if r["ok"]:
+            st.success(f"Stmt {r['stmt_num']}: OK — {preview}")
+        else:
+            st.error(f"Stmt {r['stmt_num']}: FAILED — {r['error']}")
+
+    if all_ok:
+        st.balloons()
+        st.success(f"Migration `{migration_file}` deployed successfully.")
+    else:
+        st.error("Deployment stopped on first error. See above.")
+
+
+def show_pipeline_tab(conn) -> None:
+    try:
+        ensure_pipeline_tables(conn)
+    except Exception as exc:
+        st.warning(f"Could not bootstrap pipeline tables: {exc}")
+
+    sub1, sub2, sub3 = st.tabs(["File Metrics", "Approver-1", "Deploy"])
+    with sub1:
+        _render_file_metrics(conn)
+    with sub2:
+        _render_approver1(conn)
+    with sub3:
+        _render_deploy(conn)
+
+
 def show_connect_error():
     err = st.session_state.get("spcs_connect_error")
     if not err:
@@ -593,7 +996,9 @@ def main():
                 st.session_state.pop(key, None)
             st.rerun()
 
-    demo_tab, upload_tab = st.tabs(["SPCS Demo", "SQL CI/CD Upload"])
+    demo_tab, upload_tab, pipeline_tab = st.tabs(
+        ["SPCS Demo", "SQL CI/CD Upload", "SQL Pipeline"]
+    )
     with demo_tab:
         show_runtime_panel()
         show_api_panel()
@@ -603,6 +1008,9 @@ def main():
 
     with upload_tab:
         show_sql_upload_panel()
+
+    with pipeline_tab:
+        show_pipeline_tab(conn)
 
 
 if __name__ == "__main__":
